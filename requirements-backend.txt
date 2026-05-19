@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pandas
+numpy==1.26.0
+scikit-learn
+scikit-surprise
+requests
+python-dotenv
+nltk
+plotly
+mlflow
