@@ -7,123 +7,120 @@ from surprise import Dataset, Reader, SVD
 import os
 import pickle
 
+# Set base paths for datasets
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MOVIES_METADATA_CSV = os.path.join(BASE_DIR, 'data', 'tmdb_5000_movies.csv')
+CREDITS_CSV = os.path.join(BASE_DIR, 'data', 'tmdb_5000_credits.csv')
+LINKS_CSV = os.path.join(BASE_DIR, 'data', 'links.csv')
+RATINGS_CSV = os.path.join(BASE_DIR, 'data', 'ratings.csv')
 
-MOVIES_PATH = os.path.join(BASE_DIR, 'data', 'tmdb_5000_movies.csv')
-CREDITS_PATH = os.path.join(BASE_DIR, 'data', 'tmdb_5000_credits.csv')
-LINKS_PATH = os.path.join(BASE_DIR, 'data', 'links.csv')
-RATINGS_PATH = os.path.join(BASE_DIR, 'data', 'ratings.csv')
+def parse_metadata_list(raw_json):
+    """Converts a raw JSON string into a list of name attributes."""
+    items = []
+    try:
+        for item in ast.literal_eval(raw_json):
+            items.append(item['name'])
+    except Exception:
+        pass
+    return items
 
-movies = pd.read_csv(MOVIES_PATH)
-credits = pd.read_csv(CREDITS_PATH)
-links = pd.read_csv(LINKS_PATH)
+def extract_movie_director(raw_crew_json):
+    """Parses crew JSON to find and extract the Director's name."""
+    directors = []
+    try:
+        for crew_member in ast.literal_eval(raw_crew_json):
+            if crew_member.get('job') == 'Director':
+                directors.append(crew_member['name'])
+    except Exception:
+        pass
+    return directors
 
-dtypes = {
-    'userId': 'int32',
-    'movieId': 'int32',
-    'rating': 'float32'
-}
-ratings = pd.read_csv(RATINGS_PATH, usecols=['userId', 'movieId', 'rating'], dtype=dtypes).sample(frac=0.2, random_state=42)
+def strip_spaces(names_list):
+    """Strips whitespaces inside strings to create singular tokens for TF-IDF tag extraction."""
+    return [name.replace(" ", "") for name in names_list]
 
-links.dropna(inplace=True)
-links["tmdbId"] = links["tmdbId"].astype(int)
-movies = movies.merge(credits, on = "title")
-movies = movies[['movie_id','title','overview','genres','keywords','cast','crew']]
+def train_recommender_models():
+    """Reads raw datasets, prepares structural textual features, trains SVD/TF-IDF models and saves pickle files."""
+    print("Loading raw CSV files from data directory...")
+    if not (os.path.exists(MOVIES_METADATA_CSV) and os.path.exists(CREDITS_CSV) and os.path.exists(LINKS_CSV) and os.path.exists(RATINGS_CSV)):
+        print("Error: Missing dataset CSV files in the 'data/' folder. Please download the datasets first.")
+        return
+        
+    movies_df = pd.read_csv(MOVIES_METADATA_CSV)
+    credits_df = pd.read_csv(CREDITS_CSV)
+    links_df = pd.read_csv(LINKS_CSV)
+    
+    ratings_dtype = {'userId': 'int32', 'movieId': 'int32', 'rating': 'float32'}
+    ratings_df = pd.read_csv(RATINGS_CSV, usecols=['userId', 'movieId', 'rating'], dtype=ratings_dtype)
+    # Take a representative 20% sample for performance speed and memory efficiency
+    ratings_sampled = ratings_df.sample(frac=0.2, random_state=42)
 
-movies = movies.merge(links[['movieId', 'tmdbId']], left_on='movie_id', right_on='tmdbId', how='inner')
-movies.drop(columns=['tmdbId'], inplace=True)
+    # Data Processing & Cleansing
+    links_df.dropna(inplace=True)
+    links_df["tmdbId"] = links_df["tmdbId"].astype(int)
+    
+    # Merge movies with credits
+    merged_movies = movies_df.merge(credits_df, on="title")
+    merged_movies = merged_movies[['movie_id', 'title', 'overview', 'genres', 'keywords', 'cast', 'crew']]
+    
+    # Merge with links to resolve movieLens and TMDB mappings
+    aligned_movies = merged_movies.merge(links_df[['movieId', 'tmdbId']], left_on='movie_id', right_on='tmdbId', how='inner')
+    aligned_movies.drop(columns=['tmdbId'], inplace=True)
+    aligned_movies.rename(columns={"movie_id": "tmdbID"}, inplace=True)
+    aligned_movies.dropna(inplace=True)
 
-movies.rename(columns={"movie_id":"tmdbID"},inplace=True)
+    # Parse JSON attributes
+    aligned_movies['genres'] = aligned_movies['genres'].apply(parse_metadata_list)
+    aligned_movies['keywords'] = aligned_movies['keywords'].apply(parse_metadata_list)
+    aligned_movies['cast'] = aligned_movies['cast'].apply(parse_metadata_list).apply(lambda x: x[0:10])
+    aligned_movies['crew'] = aligned_movies['crew'].apply(extract_movie_director)
 
-movies.dropna(inplace=True)
+    # Strip whitespaces to prepare for content tag vectorization
+    aligned_movies['cast'] = aligned_movies['cast'].apply(strip_spaces)
+    aligned_movies['crew'] = aligned_movies['crew'].apply(strip_spaces)
+    aligned_movies['genres'] = aligned_movies['genres'].apply(strip_spaces)
+    aligned_movies['keywords'] = aligned_movies['keywords'].apply(strip_spaces)
+    
+    # Split text descriptions into list of words
+    aligned_movies['overview'] = aligned_movies['overview'].apply(lambda x: x.split())
+    
+    # Concatenate features into single tags column
+    aligned_movies['tags'] = (aligned_movies['overview'] + 
+                              aligned_movies['genres'] + 
+                              aligned_movies['keywords'] + 
+                              aligned_movies['cast'] + 
+                              aligned_movies['crew'])
+    
+    processed_movies = aligned_movies.drop(columns=['overview', 'genres', 'keywords', 'cast', 'crew'])
+    processed_movies['tags'] = processed_movies['tags'].apply(lambda x: " ".join(x))
 
-def convert(text):
-    L = []
-    for i in ast.literal_eval(text):
-        L.append(i['name']) 
-    return L 
-movies['genres'] = movies['genres'].apply(convert)
-movies['keywords'] = movies['keywords'].apply(convert)
+    # Perform TF-IDF Vectorization & Cosine Similarity for Content-based filtering
+    print("Computing TF-IDF matrices & Cosine similarity...")
+    tfidf_vectorizer = TfidfVectorizer(max_features=5000, stop_words='english')
+    tfidf_matrices = tfidf_vectorizer.fit_transform(processed_movies['tags'])
+    cosine_sim_matrix = cosine_similarity(tfidf_matrices)
 
-movies['cast'] = movies['cast'].apply(convert)
-movies['cast'] = movies['cast'].apply(lambda x:x[0:10])
+    # Train Collaborative Filtering SVD Model
+    print("Fitting SVD matrix factorization collaborative engine...")
+    rating_reader = Reader(rating_scale=(0.5, 5.0))
+    ratings_dataset = Dataset.load_from_df(ratings_sampled[['userId', 'movieId', 'rating']], rating_reader)
+    full_trainset = ratings_dataset.build_full_trainset()
+    
+    collaborative_svd = SVD(n_factors=50, lr_all=0.005, reg_all=0.02, random_state=42)
+    collaborative_svd.fit(full_trainset)
 
-def fetch_director(text):
-    List = []
-    for crew in ast.literal_eval(text):
-        if crew['job'] == 'Director':
-            List.append(crew['name'])
-    return List 
-movies['crew'] = movies['crew'].apply(fetch_director)
+    # Serialize and Save Models
+    models_dir = os.path.join(BASE_DIR, 'models')
+    if not os.path.exists(models_dir):
+        os.makedirs(models_dir)
+        print(f"Created models directory: {models_dir}")
 
-def collapse(L):
-    L1 = []
-    for i in L:
-        L1.append(i.replace(" ",""))
-    return L1
+    pickle.dump(processed_movies, open(os.path.join(models_dir, 'movie_list.pkl'), 'wb'))
+    pickle.dump(cosine_sim_matrix, open(os.path.join(models_dir, 'similarity.pkl'), 'wb'))
+    pickle.dump(collaborative_svd, open(os.path.join(models_dir, 'svd_model.pkl'), 'wb'))
+    pickle.dump(ratings_sampled, open(os.path.join(models_dir, 'user_ratings.pkl'), 'wb'))
+    
+    print("Successfully generated and saved all model pickle files to /models directory.")
 
-movies['cast'] = movies['cast'].apply(collapse)
-movies['crew'] = movies['crew'].apply(collapse)
-movies['genres'] = movies['genres'].apply(collapse)
-movies['keywords'] = movies['keywords'].apply(collapse)
-movies['overview'] = movies['overview'].apply(lambda x:x.split())
-movies['tags'] = movies['overview'] + movies['genres'] + movies['keywords'] + movies['cast'] + movies['crew']
-final_movies = movies.drop(columns=['overview','genres','keywords','cast','crew'])
-final_movies['tags'] = final_movies['tags'].apply(lambda x: " ".join(x))
-final_movies.head()
-
-tf_idf = TfidfVectorizer(max_features=5000, stop_words='english')
-movie_vectors = tf_idf.fit_transform(final_movies['tags'])
-movie_vectors.shape
-
-movie_vectors
-
-similarity = cosine_similarity(movie_vectors)
-
-similarity
-
-reader = Reader(rating_scale=(0.5, 5.0))
-data = Dataset.load_from_df(ratings[['userId', 'movieId', 'rating']], reader)
-
-trainset = data.build_full_trainset()
-svd_model = SVD(n_factors=50, lr_all=0.005, reg_all=0.02, random_state=42)
-svd_model.fit(trainset)
-
-def recommend(user_id, movie_title):
-  if movie_title not in final_movies["title"].values:
-    return []
-
-  movie_idx = final_movies[final_movies["title"] == movie_title].index[0]
-  scores = list(enumerate(similarity[movie_idx]))
-  scores = sorted(scores, key=lambda x: x[1], reverse=True)[1:101]
-
-  hybrid_pred = []
-
-  for idx, score in scores:
-    row = final_movies.iloc[idx]
-    tmdb_id = row["tmdbID"]
-    movie_id = row["movieId"]
-    title = row["title"]
-    svd_pred = svd_model.predict(user_id, movie_id).est
-    normalized_svd = (svd_pred - 0.5)/4.5
-    final_score = (0.6 * score) + (0.4 * normalized_svd)
-
-    hybrid_pred.append({
-        "tmdbID": tmdb_id,
-        "movieID": movie_id,
-        "title": title,
-        "score": final_score
-    })
-
-  hybrid_pred = sorted(hybrid_pred, key=lambda x: x["score"], reverse=True)
-  return hybrid_pred[:5]
-
-model_path = os.path.join(BASE_DIR, 'models')
-
-if not os.path.exists(model_path):
-    os.makedirs(model_path)
-    print(f"Created directory: {model_path}")
-
-pickle.dump(final_movies, open(os.path.join(model_path, 'movie_list.pkl'), 'wb'))
-pickle.dump(similarity, open(os.path.join(model_path, 'similarity.pkl'), 'wb'))
-pickle.dump(svd_model, open(os.path.join(model_path, 'svd_model.pkl'), 'wb'))
+if __name__ == "__main__":
+    train_recommender_models()
